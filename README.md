@@ -2,6 +2,32 @@
 
 This document explains an ETL (Extract, Transform, Load) process designed to calculate and store weekly summaries of movie rental activity from a source database (Pagila) into a summary table in a target database (Rollup). This particular version uses an incremental approach, meaning it only processes changes since its last successful run, making it efficient.
 
+## Key Tables and Columns
+
+This ETL process interacts with the following key tables and columns:
+
+**Source Database: Pagila**
+
+*   **`rental` table:** This is the primary source of data.
+    *   `rental_id`: Unique identifier for each rental.
+    *   `rental_date`: Timestamp of when the rental occurred.
+    *   `return_date`: Timestamp of when the item was returned (can be NULL if not yet returned).
+    *   `last_update`: Timestamp indicating the last time the rental record was modified. This column is crucial for the incremental update logic.
+
+**Destination Database: Rollup**
+
+*   **`weekly_rental_summary` table:** Stores the aggregated weekly summaries.
+    *   `week_beginning` (DATE, Primary Key): The Monday of the week being summarized.
+    *   `"OutstandingRentals"` (INTEGER): Count of rentals outstanding at the end of the week.
+    *   `"ReturnedRentals"` (INTEGER): Count of rentals returned during the week.
+    *   `newly_rented_during_week` (INTEGER): Count of new rentals initiated during the week.
+    *   `net_change_in_outstanding` (INTEGER): The net change in outstanding rentals (newly rented - returned).
+    *   `last_updated` (TIMESTAMP): Timestamp of when this summary row was last calculated by the ETL.
+
+*   **`etl_watermarks` table:** Used by the ETL to track its progress.
+    *   `process_name` (VARCHAR, Primary Key): Identifier for the ETL process (e.g., "pagila_weekly_rental_summary").
+    *   `last_successful_update_timestamp` (TIMESTAMP): The `last_update` value from the source `rental` table up to which data has been successfully processed and summarized.
+
 ## ETL Approach Explained
 
 The main idea is to keep our `weekly_rental_summary` table in the Rollup database up-to-date without having to recalculate everything from scratch every time. We only focus on what's new or changed in the source `rental` table and ensure our summary isn't missing recent weeks.
@@ -12,13 +38,13 @@ The main idea is to keep our `weekly_rental_summary` table in the Rollup databas
     *   Before anything else, if the main `weekly_rental_summary` table in the Rollup database is found to be completely empty (like on a brand-new setup or after a manual reset), the script resets its "bookmark" (see next step) to the very beginning. This ensures it attempts to load all historical data from Pagila on its first proper run against an empty target.
 
 2.  **Remembering the Last Run (The "Bookmark"):**
-    *   The script first checks a special table called `etl_watermarks` in the Rollup database.
+    *   The script first checks a  table called `etl_watermarks` in the Rollup database.
     *   This table stores a timestamp indicating the `last_update` time of the rental records that were considered during the last successful run. This is our bookmark.
     *   If no bookmark is found (and the target isn't empty as per Step 1), it usually assumes it needs to process everything from a very old default date.
 
 3.  **Figuring Out What Needs Attention:**
     *   The script then looks for two main kinds of work:
-        *   **A. Source Data Changes:** It asks the Pagila `rental` table: "Show me all rental records that have been updated or created since my last bookmark (`last_update` > previous bookmark)."
+        *   **A. Source Data Changes:** It queries the Pagila `rental` table for all records where the `last_update` timestamp is more recent than the previously stored bookmark.
         *   **B. Gaps at the End of Our Summary:** It checks if the Pagila `rental` table has activity for weeks more recent than what's currently in our `weekly_rental_summary` table. For instance, if our summary ends at "Week 10" but Pagila has rental activity in "Week 11" and "Week 12", these future weeks are noted.
     *   It also finds out the most recent `last_update` timestamp currently in the Pagila `rental` table. This will become our new bookmark if this run is successful and there were source data changes.
 
@@ -82,7 +108,6 @@ The main idea is to keep our `weekly_rental_summary` table in the Rollup databas
     *   Using `CREATE TABLE IF NOT EXISTS` for database tables.
     *   Using `INSERT ... ON CONFLICT DO UPDATE` (an "upsert") when saving summaries, so existing weekly records are updated, and new ones are inserted.
     *   Reliable watermarking ensures it picks up from where it left off.
-*   **Modularity:** The Python script is organized into logical steps.
 *   **Reliability (Error Handling):**
     *   If an error occurs, the script attempts to roll back changes in the target database for the current run to avoid partial updates.
     *   The watermark is only updated after all steps complete successfully. If it fails midway, the watermark remains unchanged, and the next run will reprocess the same data window.
