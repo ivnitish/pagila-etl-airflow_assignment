@@ -4,67 +4,76 @@ This document explains an ETL (Extract, Transform, Load) process designed to cal
 
 ## ETL Approach Explained
 
-The main idea is to keep our `weekly_rental_summary` table in the Rollup database up-to-date without having to recalculate everything from scratch every time. We only focus on what's new or changed in the source `rental` table.
+The main idea is to keep our `weekly_rental_summary` table in the Rollup database up-to-date without having to recalculate everything from scratch every time. We only focus on what's new or changed in the source `rental` table and ensure our summary isn't missing recent weeks.
 
 **How it Works (Step-by-Step):**
 
-1.  **Remembering the Last Run:**
+0.  **Special Handling for a Fresh Start:**
+    *   Before anything else, if the main `weekly_rental_summary` table in the Rollup database is found to be completely empty (like on a brand-new setup or after a manual reset), the script smartly resets its "bookmark" (see next step) to the very beginning. This ensures it attempts to load all historical data from Pagila on its first proper run against an empty target.
+
+1.  **Remembering the Last Run (The "Bookmark"):**
     *   The script first checks a special table called `etl_watermarks` in the Rollup database.
-    *   This table stores a timestamp indicating the `last_update` time of the rental records that were processed during the last successful run. Think of this as a bookmark.
-    *   If it's the very first time the script runs, it assumes it needs to process everything from the beginning of time (a very old default date like 1900-01-01).
+    *   This table stores a timestamp indicating the `last_update` time of the rental records that were considered during the last successful run. This is our bookmark.
+    *   If no bookmark is found (and the target isn't empty as per Step 0), it usually assumes it needs to process everything from a very old default date (like 1900-01-01).
 
-2.  **Finding New or Changed Rentals:**
-    *   The script then asks the source Pagila `rental` table: "Show me all rental records that have been updated or created since my last bookmark (`last_update` > previous bookmark)."
-    *   It also finds out the most recent `last_update` timestamp currently in the Pagila `rental` table. This will become our new bookmark if this run is successful.
+2.  **Figuring Out What Needs Attention:**
+    *   The script then looks for two main kinds of work:
+        *   **A. Source Data Changes:** It asks the Pagila `rental` table: "Show me all rental records that have been updated or created since my last bookmark (`last_update` > previous bookmark)."
+        *   **B. Gaps at the End of Our Summary:** It checks if the Pagila `rental` table has activity for weeks more recent than what's currently in our `weekly_rental_summary` table. For instance, if our summary ends at "Week 10" but Pagila has rental activity in "Week 11" and "Week 12", these future weeks are noted.
+    *   It also finds out the most recent `last_update` timestamp currently in the Pagila `rental` table. This will become our new bookmark if this run is successful and there were source data changes.
 
-3.  **Handling No Changes:**
-    *   If no rental records have changed since the last bookmark, the script simply updates the bookmark to the current time (the most recent `last_update` it found) and finishes. Quick and easy!
+3.  **Deciding if There's Work To Do:**
+    *   The script now looks at what it found in Step 2.
+    *   If *neither* source data changes (A) nor gaps at the end of our summary (B) identify any weeks needing processing, the script simply updates the bookmark to the most recent `last_update` it found in Pagila (if applicable, or keeps it as is if source `last_update` hasn't advanced) and finishes. Nice and quick!
 
-4.  **Listing Affected Weeks (with Pandas):**
-    *   If there *are* new or changed rental records, the script uses the Pandas library to help with a simple task:
-        *   It looks at the `rental_date` and `return_date` for each of these changed records.
-        *   It makes a list of all the unique weeks that these dates fall into. For example, if a movie was rented on Monday, Jan 2nd, and returned on Friday, Jan 6th, both belonging to the same week, that week (e.g., starting Monday, Jan 2nd) is added to our list of "weeks to recheck."
-    *   This list now contains all the specific weeks whose summaries might need to be updated.
+4.  **Listing All Affected Weeks (with Pandas):**
+    *   If there *is* work to do (from A, B, or both), the script uses the Pandas library to make a combined, unique list of all weeks that need attention.
+        *   For weeks identified by source data changes (A), it looks at the `rental_date` and `return_date` for each of these changed records. It determines all unique weeks these dates fall into.
+        *   These are combined with any weeks identified as missing from the end of our summary (B).
+    *   This final list contains all the specific weeks whose summaries might need to be (re)calculated.
 
-5.  **Recalculating Summaries for Affected Weeks:**
-    *   For *each week* in the "weeks to recheck" list:
+5.  **Recalculating Summaries for Each Affected Week:**
+    *   For *each week* in the "weeks to recheck" list from Step 4:
         *   The script goes back to the main Pagila `rental` table.
         *   It performs a fresh calculation for that specific week, counting:
+            *   `"OutstandingRentals"`: How many movies were still out on rent at the very end of this week (this is the new name for `outstanding_rentals_at_week_end`).
+            *   `"ReturnedRentals"`: How many movies were returned during this week (this is the new name for `returned_rentals_during_week`).
             *   `newly_rented_during_week`: How many new movies were rented out during this week.
-            *   `returned_rentals_during_week`: How many movies were returned during this week.
-            *   `outstanding_rentals_at_week_end`: How many movies were still out on rent at the very end of this week.
             *   `net_change_in_outstanding`: The difference between newly rented and returned.
-        *   This recalculation uses the current, complete data from the Pagila `rental` table for that week.
+        *   This recalculation uses the current, complete data from the Pagila `rental` table for that week, regardless of why the week was flagged for processing.
 
 6.  **Saving the Summaries:**
-    *   The newly calculated summary figures for each affected week are then saved into the `weekly_rental_summary` table in the Rollup database.
+    *   The newly calculated summary figures for each affected week are then saved into the `weekly_rental_summary` table in the Rollup database. The columns will be in the new order: `week_beginning`, `"OutstandingRentals"`, `"ReturnedRentals"`, `newly_rented_during_week`, `net_change_in_outstanding`, `last_updated`.
     *   If a summary for that week already exists, it's updated with the new figures. If it's a new week, a new row is inserted.
     *   A `last_updated` timestamp is also recorded in the summary table for that week.
 
 7.  **Updating the Bookmark:**
-    *   Once all affected weeks are processed and summaries are saved successfully, the script updates its bookmark in the `etl_watermarks` table to the most recent `last_update` timestamp it found in step 2. This way, the next run knows where to start from.
+    *   Once all affected weeks are processed and summaries are saved successfully, the script updates its bookmark in the `etl_watermarks` table. The new bookmark will be the most recent `last_update` timestamp it found in Pagila earlier (from Step 2). This way, the next run knows where to start from for detecting source data changes.
 
 **How Data Changes are Handled:**
 
 *   **New Rental Record:**
-    *   The script will pick up this new record because its `last_update` timestamp will be recent.
+    *   The script will pick this up via "Source Data Changes" (Step 2A) because its `last_update` timestamp will be recent.
     *   The week of its `rental_date` will be added to the "weeks to recheck."
-    *   The summary for that week will be recalculated, including this new rental in `newly_rented_during_week` and `outstanding_rentals_at_week_end`.
+    *   The summary for that week will be recalculated (Step 5), including this new rental in `newly_rented_during_week` and `"OutstandingRentals"`.
 
 *   **Rental Record Updated (e.g., `return_date` is added/changed):**
-    *   The script will pick up this updated record because its `last_update` timestamp will be recent.
-    *   The week of its `rental_date` AND the week of its `return_date` (if it has one) will be added to the "weeks to recheck."
+    *   Picked up via "Source Data Changes" (Step 2A).
+    *   The week of its `rental_date` AND the week of its `return_date` (if it has one) will be added to "weeks to recheck."
     *   Summaries for both these weeks will be recalculated:
-        *   The `rental_date` week will have its `outstanding_rentals_at_week_end` count updated.
-        *   The `return_date` week will have its `returned_rentals_during_week` count updated.
-        *   `newly_rented_during_week` for the rental week usually won't change unless the rental record itself was just created.
+        *   The `rental_date` week will have its `"OutstandingRentals"` count updated.
+        *   The `return_date` week will have its `"ReturnedRentals"` count updated.
 
 *   **Old Record Updated (e.g., a `return_date` from months ago is corrected):**
-    *   As long as the `last_update` timestamp on that old record is changed to reflect this correction, the script will pick it up.
-    *   The weeks related to its `rental_date` and the (new/corrected) `return_date` will be added to the "weeks to recheck."
+    *   As long as the `last_update` timestamp on that old record is changed, it's picked up by "Source Data Changes" (Step 2A).
+    *   The weeks related to its `rental_date` and the (new/corrected) `return_date` will be added to "weeks to recheck."
     *   Summaries for these (potentially old) weeks will be fully recalculated from the source, ensuring historical accuracy for those specific weeks.
 
-**Important Note on `last_update`:** This whole process relies heavily on the `last_update` column in the source `rental` table being accurately maintained. Every time a rental record is created or any important field (like `return_date`) is changed, `last_update` must be updated to the current time.
+*   **No Source `last_update` Changes, but Target is Behind:**
+    *   If the source Pagila database has rental activity (e.g., rentals from last week) that hasn't yet made it into our `weekly_rental_summary` table, "Gaps at the End of Our Summary" (Step 2B) will identify these missing weeks.
+    *   These weeks will be added to "weeks to recheck" and their summaries will be calculated and added to the target table. This ensures the target catches up even if no individual records were recently modified via `last_update`.
+
+**Important Note on `last_update`:** The "Source Data Changes" part of this process relies heavily on the `last_update` column in the source `rental` table being accurately maintained. Every time a rental record is created or any important field (like `return_date`) is changed, `last_update` must be updated to the current time.
 
 ## Key ETL Aspects Covered
 
