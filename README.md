@@ -79,7 +79,7 @@ The main idea is to keep our `weekly_rental_summary` table in the Rollup databas
     *   The watermark is only updated after all steps complete successfully. If it fails midway, the watermark remains unchanged, and the next run will reprocess the same data window.
 *   **Auditability:** The script includes print statements (which go to Airflow logs) indicating its progress. The `last_updated` column in `weekly_rental_summary` also provides an audit trail for when each week's summary was last processed.
 
-## Conceptual Docker Setup for Development/Testing
+##  Docker Setup for Development/Testing
 
 While the script itself doesn't manage Docker, here's how you might set up the environment using Docker Compose for development or testing:
 

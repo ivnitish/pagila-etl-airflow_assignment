@@ -12,10 +12,18 @@ DEFAULT_WATERMARK_START_DATE = datetime(1900, 1, 1, tzinfo=timezone.utc) # Make 
 # --- Helper to get Airflow connection details (if running in Airflow) ---
 def get_db_connection_details(conn_id):
     """
-    Retrieves connection details from Airflow.
-    This is a simplified version. In a real Airflow environment,
-    you'd use BaseHook.get_connection(conn_id).
-    For local testing, you might replace this with direct connection strings.
+    Retrieves database connection parameters using Airflow's BaseHook.
+
+    This function fetches connection details (host, port, dbname, user, password)
+    for a given Airflow connection ID. It's used by the DAG to pass
+    credentials to the ETL logic and can also be used for local testing
+    if the local environment is configured to resolve Airflow connections.
+
+    Args:
+        conn_id (str): The Airflow connection ID to retrieve.
+
+    Returns:
+        dict: A dictionary containing database connection parameters.
     """
     from airflow.hooks.base import BaseHook
     conn = BaseHook.get_connection(conn_id)
@@ -52,10 +60,10 @@ def run_incremental_etl(pagila_conn_params, rollup_conn_params):
         create_summary_table_sql = """
         CREATE TABLE IF NOT EXISTS weekly_rental_summary (
             week_beginning DATE PRIMARY KEY,
+            "OutstandingRentals" INTEGER,
+            "ReturnedRentals" INTEGER,
             newly_rented_during_week INTEGER,
-            returned_rentals_during_week INTEGER,
             net_change_in_outstanding INTEGER,
-            outstanding_rentals_at_week_end INTEGER,
             last_updated TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
         );
         """
@@ -74,6 +82,25 @@ def run_incremental_etl(pagila_conn_params, rollup_conn_params):
         rollup_conn.commit()
         print("Ensured 'etl_watermarks' table exists in Rollup DB.")
 
+        # --- New Step: Proactively Reset Watermark if Target Table is Empty ---
+        print("Step 0: Checking if target table 'weekly_rental_summary' is empty to potentially reset watermark...")
+        rollup_cur.execute("SELECT 1 FROM weekly_rental_summary LIMIT 1;")
+        target_table_has_any_data = rollup_cur.fetchone()
+
+        if not target_table_has_any_data:
+            print("  Target table 'weekly_rental_summary' is empty. Resetting watermark to default start date to ensure full load.")
+            reset_watermark_sql = """
+            INSERT INTO etl_watermarks (process_name, last_successful_update_timestamp)
+            VALUES (%s, %s)
+            ON CONFLICT (process_name) DO UPDATE SET
+                last_successful_update_timestamp = EXCLUDED.last_successful_update_timestamp;
+            """
+            # Store naive UTC version of DEFAULT_WATERMARK_START_DATE
+            rollup_cur.execute(reset_watermark_sql, (ETL_PROCESS_NAME, DEFAULT_WATERMARK_START_DATE.replace(tzinfo=None)))
+            rollup_conn.commit()
+            print(f"  Watermark for '{ETL_PROCESS_NAME}' reset to: {DEFAULT_WATERMARK_START_DATE.replace(tzinfo=None)}")
+        else:
+            print("  Target table 'weekly_rental_summary' is not empty. Proceeding with existing watermark.")
 
         # --- 1. Determine Time Window for Changes ---
         print("Step 1: Determining time window for changes...")
@@ -109,98 +136,61 @@ def run_incremental_etl(pagila_conn_params, rollup_conn_params):
             current_max_source_update = previous_watermark
         
         # Now both previous_watermark and current_max_source_update should be UTC-aware.
-        if not current_max_source_update_raw: # If there was no MAX(last_update) from source at all
-            print("No 'last_update' values found in source rental table. Assuming no new data.")
-            # Update watermark to current_max_source_update (which is previous_watermark here) or previous_watermark itself.
-            # Update watermark to current_max_source_update to prevent reprocessing the same data if it's a no-op run
-            update_watermark_sql = """
-                INSERT INTO etl_watermarks (process_name, last_successful_update_timestamp)
-                VALUES (%s, %s)
-                ON CONFLICT (process_name) DO UPDATE SET
-                    last_successful_update_timestamp = EXCLUDED.last_successful_update_timestamp;
+        # We no longer exit early here solely based on source last_update. 
+        # We'll determine Set A (source changes) and Set B (target gaps) then decide.
+
+        print(f"  Current max source update (UTC) from source: {current_max_source_update}") # Renamed for clarity
+
+        # --- 2. Extract Changed Data (Delta Extraction) for Set A ---
+        print(f"Step 2: Potentially extracting changed data from source for Set A (if last_update > {previous_watermark})...")
+        changed_rentals_df = pd.DataFrame() # Initialize as empty
+
+        if current_max_source_update > previous_watermark:
+            delta_sql = """
+                SELECT rental_id, rental_date, return_date, last_update
+                FROM rental
+                WHERE last_update > %s AND last_update <= %s;
             """
-            # We store naive UTC timestamps in the watermark table
-            rollup_cur.execute(update_watermark_sql, (ETL_PROCESS_NAME, current_max_source_update.replace(tzinfo=None) if current_max_source_update else None))
-            rollup_conn.commit()
-            print(f"  Watermark updated to {current_max_source_update.replace(tzinfo=None) if current_max_source_update else None} (naive UTC) as no new data or no source activity.")
-            return # Exit early
-
-        # This comparison should now be safe between two aware datetime objects
-        if current_max_source_update <= previous_watermark:
-            print(f"No new data found based on 'last_update' in source ({current_max_source_update}) compared to previous watermark ({previous_watermark}).")
-            update_watermark_sql = """
-                INSERT INTO etl_watermarks (process_name, last_successful_update_timestamp)
-                VALUES (%s, %s)
-                ON CONFLICT (process_name) DO UPDATE SET
-                    last_successful_update_timestamp = EXCLUDED.last_successful_update_timestamp;
-            """
-            # Store naive UTC
-            rollup_cur.execute(update_watermark_sql, (ETL_PROCESS_NAME, current_max_source_update.replace(tzinfo=None)))
-            rollup_conn.commit()
-            print(f"  Watermark updated to {current_max_source_update.replace(tzinfo=None)} (naive UTC).")
-            return # Exit early
-
-        print(f"  Current max source update (UTC): {current_max_source_update}")
-
-
-        # --- 2. Extract Changed Data (Delta Extraction) ---
-        # When passing datetimes to pd.read_sql_query params for psycopg2, it's often best to pass them as strings
-        # or ensure psycopg2 handles the conversion correctly. psycopg2 can handle aware datetimes.
-        print(f"Step 2: Extracting changed data from source (last_update > {previous_watermark} and <= {current_max_source_update})...")
-        delta_sql = """
-            SELECT rental_id, rental_date, return_date, last_update
-            FROM rental
-            WHERE last_update > %s AND last_update <= %s;
-        """
-        changed_rentals_df = pd.read_sql_query(delta_sql, pagila_conn, params=(previous_watermark, current_max_source_update))
-        print(f"  Found {len(changed_rentals_df)} changed/new rental records.")
-
-        if changed_rentals_df.empty:
-            print("  No rental records found in the determined time window. Updating watermark and exiting.")
-            update_watermark_sql = """
-                INSERT INTO etl_watermarks (process_name, last_successful_update_timestamp)
-                VALUES (%s, %s)
-                ON CONFLICT (process_name) DO UPDATE SET
-                    last_successful_update_timestamp = EXCLUDED.last_successful_update_timestamp;
-            """
-            # Store naive UTC
-            rollup_cur.execute(update_watermark_sql, (ETL_PROCESS_NAME, current_max_source_update.replace(tzinfo=None)))
-            rollup_conn.commit()
-            print(f"  Watermark updated to {current_max_source_update.replace(tzinfo=None)} (naive UTC).")
-            return
+            changed_rentals_df = pd.read_sql_query(delta_sql, pagila_conn, params=(previous_watermark, current_max_source_update))
+            print(f"  Found {len(changed_rentals_df)} changed/new rental records for Set A based on source last_update.")
+        else:
+            print(f"  No new rental records for Set A based on source last_update (current_max_source_update: {current_max_source_update} <= previous_watermark: {previous_watermark}).")
 
         # --- 3. Identify Affected Weeks ---
-        print("Step 3: Identifying affected weeks from the delta...")
-        # Ensure date columns are datetime objects
-        changed_rentals_df['rental_date'] = pd.to_datetime(changed_rentals_df['rental_date'])
-        changed_rentals_df['return_date'] = pd.to_datetime(changed_rentals_df['return_date'], errors='coerce') # Coerce invalid dates to NaT
+        # Step 3a: Identify Set A (weeks affected by source last_update changes)
+        print("Step 3a: Identifying Set A (weeks affected by source 'last_update' changes)...")
+        # Ensure date columns are datetime objects if dataframe is not empty
+        if not changed_rentals_df.empty:
+            changed_rentals_df['rental_date'] = pd.to_datetime(changed_rentals_df['rental_date'])
+            changed_rentals_df['return_date'] = pd.to_datetime(changed_rentals_df['return_date'], errors='coerce') # Coerce invalid dates to NaT
+        else:
+            print("  No data in changed_rentals_df for Set A processing.")
 
-        set_a_affected_weeks = set() # Weeks affected by source last_update changes
-        for _, row in changed_rentals_df.iterrows():
-            if pd.notna(row['rental_date']):
-                set_a_affected_weeks.add((row['rental_date'] - timedelta(days=row['rental_date'].weekday())).date())
-            if pd.notna(row['return_date']):
-                set_a_affected_weeks.add((row['return_date'] - timedelta(days=row['return_date'].weekday())).date())
+        set_a_affected_weeks = set() 
+        if not changed_rentals_df.empty: # Process only if there are records
+            for _, row in changed_rentals_df.iterrows():
+                if pd.notna(row['rental_date']):
+                    set_a_affected_weeks.add((row['rental_date'] - timedelta(days=row['rental_date'].weekday())).date())
+                if pd.notna(row['return_date']):
+                    set_a_affected_weeks.add((row['return_date'] - timedelta(days=row['return_date'].weekday())).date())
         
-        print(f"  Set A: Identified {len(set_a_affected_weeks)} unique weeks affected by source 'last_update' changes: {sorted(list(set_a_affected_weeks))}")
+        print(f"  Set A: Identified {len(set_a_affected_weeks)} unique weeks: {sorted(list(set_a_affected_weeks))}")
 
-        # --- New Step: Identify Weeks Missing from Target's End (Set B) ---
-        print("Step 3b: Identifying weeks potentially missing from the end of the target summary table...")
+        # Step 3b: Identify Weeks Missing from Target's End (Set B) ---
+        # This logic remains the same as before
+        print("Step 3b: Identifying Set B (weeks potentially missing from the end of the target summary table)...")
         set_b_missing_target_weeks = set()
 
-        # Get max expected week from source data
         pagila_cur.execute("SELECT MAX(GREATEST(rental_date, COALESCE(return_date, rental_date))) AS max_activity_date FROM rental;")
         max_source_activity_date_result = pagila_cur.fetchone()
         max_expected_week_in_source = None
         if max_source_activity_date_result and max_source_activity_date_result['max_activity_date']:
-            # Ensure it's converted to datetime before date operations
             max_activity_dt_obj = pd.to_datetime(max_source_activity_date_result['max_activity_date'])
             max_expected_week_in_source = (max_activity_dt_obj - timedelta(days=max_activity_dt_obj.weekday())).date()
             print(f"  Max expected week based on all source activity: {max_expected_week_in_source}")
         else:
             print("  Could not determine max expected week from source (source might be empty or no relevant dates found).")
 
-        # Get max actual week in target summary table
         rollup_cur.execute("SELECT MAX(week_beginning) AS max_target_week FROM weekly_rental_summary;")
         max_target_week_result = rollup_cur.fetchone()
         actual_max_week_in_target = None
@@ -210,48 +200,53 @@ def run_incremental_etl(pagila_conn_params, rollup_conn_params):
         else:
             print("  Target summary table is empty or contains no week_beginning dates.")
 
-        if max_expected_week_in_source: # Only proceed if we have a valid upper bound from source
+        if max_expected_week_in_source: 
             start_date_for_set_b = None
             if actual_max_week_in_target is None: 
-                # Target is empty. We need to fill from the earliest source week up to max_expected_week_in_source
-                # However, Set A (driven by old watermark 1900-01-01) should already identify all relevant weeks from source.
-                # So, for an empty target, Set B can remain empty, relying on Set A logic.
-                print("  Target is empty. Set A (source changes from 1900-01-01) should handle initial population.")
+                # If target is empty, Set B will try to fill from the earliest source data up to max_expected_week_in_source
+                # Need to find the MIN source week to start from in this specific scenario for Set B
+                pagila_cur.execute("SELECT MIN(GREATEST(rental_date, COALESCE(return_date, rental_date))) AS min_activity_date FROM rental WHERE rental_date IS NOT NULL;") # ensure rental_date exists for a valid week
+                min_source_activity_date_result = pagila_cur.fetchone()
+                if min_source_activity_date_result and min_source_activity_date_result['min_activity_date']:
+                    min_activity_dt_obj = pd.to_datetime(min_source_activity_date_result['min_activity_date'])
+                    start_date_for_set_b = (min_activity_dt_obj - timedelta(days=min_activity_dt_obj.weekday())).date()
+                    print(f"  Target is empty. Set B will aim to fill from earliest source week: {start_date_for_set_b} up to {max_expected_week_in_source}.")
+                else:
+                    print("  Target is empty, but could not determine earliest source week for Set B population. Set A (if any) will be primary.")
             elif actual_max_week_in_target < max_expected_week_in_source:
                 start_date_for_set_b = actual_max_week_in_target + timedelta(weeks=1)
-                print(f"  Target max week ({actual_max_week_in_target}) is before source max expected week ({max_expected_week_in_source}). Will check for missing weeks in Set B from {start_date_for_set_b}.")
+                print(f"  Target max week ({actual_max_week_in_target}) is before source max expected week ({max_expected_week_in_source}). Set B will check from {start_date_for_set_b}.")
             
-            if start_date_for_set_b: # If there's a range to fill for Set B
+            if start_date_for_set_b: 
                 current_week_to_add = start_date_for_set_b
                 while current_week_to_add <= max_expected_week_in_source:
                     set_b_missing_target_weeks.add(current_week_to_add)
                     current_week_to_add += timedelta(weeks=1)
         
         if set_b_missing_target_weeks:
-            print(f"  Set B: Identified {len(set_b_missing_target_weeks)} weeks potentially missing from target's end: {sorted(list(set_b_missing_target_weeks))}")
+            print(f"  Set B: Identified {len(set_b_missing_target_weeks)} weeks: {sorted(list(set_b_missing_target_weeks))}")
 
-        # Combine Set A and Set B
+        # Step 3c: Combine Set A and Set B and Determine if Early Exit is Needed
+        print("Step 3c: Combining Set A and Set B and determining if processing is needed...")
         affected_weeks_combined = set_a_affected_weeks.union(set_b_missing_target_weeks)
         affected_weeks_list = sorted(list(affected_weeks_combined))
 
         print(f"  Combined: Total {len(affected_weeks_list)} unique weeks to process: {affected_weeks_list}")
         
         if not affected_weeks_list:
-            # This condition now means no source changes AND no target gaps to fill.
-            print("  No weeks identified for processing from either source changes or target gaps. Updating watermark and exiting.")
+            print("  No weeks identified for processing from either source changes (Set A) or target end-gaps (Set B). Updating watermark and exiting.")
             update_watermark_sql = """
                 INSERT INTO etl_watermarks (process_name, last_successful_update_timestamp)
                 VALUES (%s, %s)
                 ON CONFLICT (process_name) DO UPDATE SET
                     last_successful_update_timestamp = EXCLUDED.last_successful_update_timestamp;
             """
-            # Store naive UTC
             rollup_cur.execute(update_watermark_sql, (ETL_PROCESS_NAME, current_max_source_update.replace(tzinfo=None)))
             rollup_conn.commit()
-            print(f"  Watermark updated to {current_max_source_update.replace(tzinfo=None)} (naive UTC).")
-            return
+            print(f"  Watermark updated to {current_max_source_update.replace(tzinfo=None)} (naive UTC) as no processing was needed.")
+            return # THE ONLY EARLY EXIT POINT (after Step 0)
 
-        # --- 4. Recalculate and Update Summaries for Affected Weeks ---
+        # --- 4. Recalculate and Update Summaries for Affected Weeks --- (This step number is now effectively 4)
         print(f"Step 4: Recalculating and updating summaries for {len(affected_weeks_list)} affected week(s)...")
         
         for target_week_start_dt in affected_weeks_list:
@@ -338,22 +333,23 @@ def run_incremental_etl(pagila_conn_params, rollup_conn_params):
                 # 4b. Upsert into Target Summary Table
                 upsert_sql = """
                 INSERT INTO weekly_rental_summary (
-                    week_beginning, newly_rented_during_week, returned_rentals_during_week,
-                    net_change_in_outstanding, outstanding_rentals_at_week_end, last_updated
+                    week_beginning, "OutstandingRentals", "ReturnedRentals",
+                    newly_rented_during_week, net_change_in_outstanding, last_updated
                 ) VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (week_beginning) DO UPDATE SET
+                    "OutstandingRentals" = EXCLUDED."OutstandingRentals",
+                    "ReturnedRentals" = EXCLUDED."ReturnedRentals",
                     newly_rented_during_week = EXCLUDED.newly_rented_during_week,
-                    returned_rentals_during_week = EXCLUDED.returned_rentals_during_week,
                     net_change_in_outstanding = EXCLUDED.net_change_in_outstanding,
-                    outstanding_rentals_at_week_end = EXCLUDED.outstanding_rentals_at_week_end,
                     last_updated = CURRENT_TIMESTAMP;
                 """
                 rollup_cur.execute(upsert_sql, (
                     summary_data['week_beginning'],
+                    summary_data['outstanding_rentals_at_week_end'], # Maps to "OutstandingRentals"
+                    summary_data['returned_rentals_during_week'],   # Maps to "ReturnedRentals"
                     summary_data['newly_rented_during_week'],
-                    summary_data['returned_rentals_during_week'],
-                    net_change, # Calculated net_change
-                    summary_data['outstanding_rentals_at_week_end']
+                    net_change,
+                    # last_updated is handled by CURRENT_TIMESTAMP in the SQL
                 ))
                 print(f"    Upserted summary for week {summary_data['week_beginning']}.")
             else:
