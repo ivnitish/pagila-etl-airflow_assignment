@@ -12,7 +12,7 @@ This ETL process interacts with the following key tables and columns:
     *   `rental_id`: Unique identifier for each rental.
     *   `rental_date`: Timestamp of when the rental occurred.
     *   `return_date`: Timestamp of when the item was returned (can be NULL if not yet returned).
-    *   `last_update`: Timestamp indicating the last time the rental record was modified. This column is crucial for the incremental update logic.
+    *   `last_update`: Timestamp indicating the last time the rental record was modified. This column is used for the incremental update logic.
 
 **Destination Database: Rollup**
 
@@ -28,7 +28,7 @@ This ETL process interacts with the following key tables and columns:
     *   `process_name` (VARCHAR, Primary Key): Identifier for the ETL process (e.g., "pagila_weekly_rental_summary").
     *   `last_successful_update_timestamp` (TIMESTAMP): The `last_update` value from the source `rental` table up to which data has been successfully processed and summarized.
 
-## ETL Approach Explained
+## Approach Explained
 
 The main idea is to keep our `weekly_rental_summary` table in the Rollup database up-to-date without having to recalculate everything from scratch every time. We only focus on what's new or changed in the source `rental` table and ensure our summary isn't missing recent weeks.
 
@@ -112,6 +112,20 @@ The main idea is to keep our `weekly_rental_summary` table in the Rollup databas
     *   If an error occurs, the script attempts to roll back changes in the target database for the current run to avoid partial updates.
     *   The watermark is only updated after all steps complete successfully. If it fails midway, the watermark remains unchanged, and the next run will reprocess the same data window.
 *   **Auditability:** The script includes print statements (which go to Airflow logs) indicating its progress. The `last_updated` column in `weekly_rental_summary` also provides an audit trail for when each week's summary was last processed.
+
+## Edge Cases Not Handled in Current Approach
+
+While the current ETL script is designed for efficient incremental updates based on source data changes and forward-filling of target data, there are certain edge cases or scenarios it does not explicitly handle:
+
+1.  **Manual Deletion of Past Records from Target:** If a summary record for a past week is manually deleted directly from the `weekly_rental_summary` table, this script will not automatically recreate it unless that specific week is also flagged for reprocessing due to new source data changes (`last_update` based).
+
+2.  **Manual Modification of Past Records in Target:** If data for a past week in the `weekly_rental_summary` table is manually altered (e.g., changing a count directly in the database), the script will not detect or correct this alteration unless that week is otherwise reprocessed due to source data changes.
+
+3.  **Deletions from Source Table:** If rental records are deleted from the source `rental` table in Pagila, the current ETL logic (which relies on `last_update` for new/updated records) will not automatically reflect these deletions in the `weekly_rental_summary`. The summaries might then include contributions from source records that no longer exist.
+
+4.  **Historical Source Data Changes Without `last_update` Modification:** If historical records in the source `rental` table are modified (e.g., a very old `return_date` is corrected) but their corresponding `last_update` timestamp is *not* updated to reflect this change, the ETL will not identify these records as changed and the summaries for affected past weeks will not be updated.
+
+Addressing such scenarios typically requires more complex ETL logic, such as full data reconciliations or Change Data Capture (CDC) mechanisms. The decision to implement these often depends on factors like the criticality of the data, the likelihood of these scenarios, and the acceptable margin for data discrepancy.
 
 ##  Docker Setup for Development/Testing
 
