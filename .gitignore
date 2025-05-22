@@ -1,0 +1,21 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS-specific
+.DS_Store
+
+# Project specific archive
+project_archive/
+
+# Non-essential files within pagila/
+pagila/pagila-data-apt-jsonb.backup/
+pagila/pagila-data-yum-jsonb.backup/
+pagila/restore-pagila-data-jsonb.sh/
+
+
+# Airflow logs (optional, if you don't want to commit the log directory structure)
+# airflow_setup/logs/ 
