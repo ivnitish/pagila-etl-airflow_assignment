@@ -4,33 +4,48 @@ import pendulum # Airflow's preferred way to handle dates
 
 from airflow.models.dag import DAG
 from airflow.providers.standard.operators.python import PythonOperator
+from airflow.hooks.base import BaseHook # Import BaseHook
 # We'll import your ETL script's function later
-import etl_script # Import your ETL script (updated name)
+import etl_script_incremental_pandas 
 
 # Define a Python callable that will run your ETL script
-# We'll need to modify your etl_script.py to be importable and take connection info
 def run_pagila_etl_callable(**kwargs):
     """
     This function will be called by the PythonOperator.
-    It will import and run the main logic from your etl_script.py
-    using the replica and watermark approach.
+    It will import and run the main logic from your etl_script_incremental_pandas.py
     """
-    # Placeholder for now - we will call your actual ETL script logic here
-    print("Attempting to run Pagila ETL script using replica/watermark approach...")
+    print("Attempting to run Pagila ETL script using incremental pandas approach...")
     
-    # Define the Airflow Connection IDs. These MUST match the ones
-    # you will create in the Airflow UI (Admin -> Connections).
-    pagila_db_conn_id = "pagila_postgres_connection"  # Example Connection ID
-    rollup_db_conn_id = "rollup_postgres_connection"  # Example Connection ID
+    pagila_db_conn_id = "pagila_postgres_connection"  
+    rollup_db_conn_id = "rollup_postgres_connection"  
 
-    # Call the main ETL function from the imported etl_script module
-    etl_script.run_etl_replica_approach(
-        pagila_conn_id=pagila_db_conn_id,
-        rollup_conn_id=rollup_db_conn_id
+    # Get connection parameters using Airflow Hooks
+    pagila_conn = BaseHook.get_connection(pagila_db_conn_id)
+    rollup_conn = BaseHook.get_connection(rollup_db_conn_id)
+
+    pagila_conn_params = {
+        "host": pagila_conn.host,
+        "port": pagila_conn.port,
+        "dbname": pagila_conn.schema, # In Airflow, 'schema' usually holds the database name
+        "user": pagila_conn.login,
+        "password": pagila_conn.password,
+    }
+
+    rollup_conn_params = {
+        "host": rollup_conn.host,
+        "port": rollup_conn.port,
+        "dbname": rollup_conn.schema,
+        "user": rollup_conn.login,
+        "password": rollup_conn.password,
+    }
+
+    # Call the main ETL function from the imported script
+    etl_script_incremental_pandas.run_incremental_etl(
+        pagila_conn_params=pagila_conn_params,
+        rollup_conn_params=rollup_conn_params
     )
-    # --- END INTEGRATION POINT ---
 
-    print("Pagila ETL script (replica/watermark approach) execution attempt finished.")
+    print("Pagila ETL script (incremental pandas approach) execution attempt finished.")
 
 
 with DAG(
