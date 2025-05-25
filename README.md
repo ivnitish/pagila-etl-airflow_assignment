@@ -127,6 +127,14 @@ While the current ETL script is designed for efficient incremental updates based
 
 Addressing such scenarios typically requires more complex ETL logic, such as full data reconciliations or Change Data Capture (CDC) mechanisms. The decision to implement these often depends on factors like the criticality of the data, the likelihood of these scenarios, and the acceptable margin for data discrepancy.
 
+## Further Considerations
+
+*   **Data Aggregation Levels (Daily, Monthly, etc.):**
+    The current ETL produces weekly summaries. If summaries at different granularities (e.g., daily or monthly) are required, a common best practice is to build the ETL to process and store data at the most granular level needed (e.g., daily summaries). From this detailed daily data, weekly, monthly, or other custom period aggregations can then be easily derived, typically through database views or subsequent simple aggregation jobs for reporting purposes. This approach offers maximum flexibility and avoids redundant processing of source data for each aggregation level.
+
+*   **Data for Machine Learning (ML):**
+    The ETL process described here focuses on generating operational weekly rental summaries. If data is being prepared for Machine Learning (ML) purposes, requirements often differ. ML datasets might necessitate more granular data (e.g., at the individual movie title or customer level), inclusion of a wider range of attributes (like movie genres, release dates, customer demographics), and potentially different destination tables or data formats tailored to ML model training and feature engineering.
+
 ##  Docker Setup for Development/Testing
 
 While the script itself doesn't manage Docker, here's how you might set up the environment using Docker Compose for development or testing:

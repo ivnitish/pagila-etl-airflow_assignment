@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.ipynb_checkpoints
 
 # OS-specific
 .DS_Store
@@ -15,6 +16,8 @@ project_archive/
 pagila/pagila-data-apt-jsonb.backup/
 pagila/pagila-data-yum-jsonb.backup/
 pagila/restore-pagila-data-jsonb.sh/
+airflow_setup/dags/test.py
+
 
 
 # Airflow logs (optional, if you don't want to commit the log directory structure)

@@ -1,3 +1,5 @@
+psycopg2-binary
+pandas
 apache-airflow
 apache-airflow-providers-postgres
 pendulum 
