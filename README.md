@@ -2,6 +2,8 @@
 
 This document explains an ETL (Extract, Transform, Load) process designed to calculate and store weekly summaries of movie rental activity from a source database (Pagila) into a summary table in a target database (Rollup). This particular version uses an incremental approach, meaning it only processes changes since its last successful run, making it efficient.
 
+For a visual representation of the data flow, please refer to `data_flow_chart.png` or `data_flow_chart.jpg` in the repository.
+
 ## Key Tables and Columns
 
 This ETL process interacts with the following key tables and columns:
